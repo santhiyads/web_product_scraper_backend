@@ -2,13 +2,64 @@ const axios = require("axios");
 const cheerio = require("cheerio");
 const Company = require("../models/company.model");
 
+/* ---------------- HELPERS ---------------- */
+
+async function fetchDeepPages(baseUrl) {
+  const paths = ["/about", "/about-us", "/contact", "/contact-us"];
+  const pages = [];
+
+  for (const path of paths) {
+    try {
+      const url = baseUrl.replace(/\/$/, "") + path;
+      const res = await axios.get(url, {
+        timeout: 10000,
+        headers: { "User-Agent": "Mozilla/5.0" }
+      });
+      pages.push({ url, html: res.data });
+    } catch {
+      // ignore failures
+    }
+  }
+
+  return pages;
+}
+
+function extractEmail(text) {
+  const match = text.match(
+    /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/
+  );
+  return match ? match[0] : null;
+}
+
+function extractPhones(text) {
+  const matches = text.match(/(\+91[\s\-]?)?[6-9]\d{9}/g) || [];
+  const set = new Set();
+
+  for (let p of matches) {
+    let digits = p.replace(/\D/g, "");
+    if (digits.startsWith("91") && digits.length === 12) {
+      digits = digits.slice(2);
+    }
+    if (digits.length === 10) {
+      set.add("+91" + digits);
+    }
+  }
+
+  return Array.from(set);
+}
+
+function safeMerge(original, incoming) {
+  return original ?? incoming ?? null;
+}
+
+/* ---------------- CONTROLLER ---------------- */
+
 exports.scrapeCompany = async (req, res) => {
   const startTime = Date.now();
 
   try {
     const { website } = req.body;
 
-    // ✅ CONTRACT: always HTTP 200
     if (!website) {
       return res.status(200).json({
         success: false,
@@ -21,9 +72,8 @@ exports.scrapeCompany = async (req, res) => {
       });
     }
 
-    console.log("🌐 Scraping company website:", website);
+    /* -------- HOMEPAGE -------- */
 
-    // ---------------- FETCH HOMEPAGE ----------------
     const response = await axios.get(website, {
       timeout: 15000,
       headers: { "User-Agent": "Mozilla/5.0" }
@@ -32,105 +82,31 @@ exports.scrapeCompany = async (req, res) => {
     const html = response.data;
     const $ = cheerio.load(html);
 
-    // ---------------- BASIC ----------------
-    const name =
+    let name =
       $("meta[property='og:site_name']").attr("content") ||
       $("title").text().trim() ||
       null;
 
-    const about =
+    let about =
       $("meta[name='description']").attr("content") || null;
 
     const platform = html.includes("cdn.shopify.com")
       ? "shopify"
       : "unknown";
 
-    // ---------------- EMAIL ----------------
-    let email = null;
-    const bodyText = $("body").text();
-    const emailMatch = bodyText.match(
-      /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/
-    );
-    if (emailMatch) email = emailMatch[0];
+    let email = extractEmail($("body").text());
+    let phones = extractPhones($("body").text());
 
-    // ---------------- PHONE HELPERS ----------------
-    function extractRawPhones($page) {
-      const found = [];
+    let location = null;
+    $("address").each((_, el) => {
+      const t = $(el).text().trim();
+      if (t.length > 20 && /\d/.test(t)) location = t;
+    });
 
-      $page("a[href^='tel:']").each((_, el) => {
-        found.push($page(el).attr("href"));
-      });
-
-      $page("footer").find("p, span, div").each((_, el) => {
-        const matches = $page(el)
-          .text()
-          .match(/(\+91[\s\-]?)?[6-9]\d{9}/g);
-        if (matches) found.push(...matches);
-      });
-
-      return found;
-    }
-
-    function normalizePhones(raw) {
-      const set = new Set();
-
-      raw.forEach(p => {
-        let digits = String(p).replace(/\D/g, "");
-
-        if (digits.startsWith("91") && digits.length === 12) {
-          digits = digits.slice(2);
-        }
-
-        if (digits.length === 10) {
-          set.add("+91" + digits);
-        }
-      });
-
-      return Array.from(set);
-    }
-
-    // ---------------- CONTACT PAGE ----------------
-    async function fetchContactPage(baseUrl) {
-      const paths = ["/contact", "/contact-us", "/support", "/help"];
-
-      for (const p of paths) {
-        try {
-          const res = await axios.get(baseUrl.replace(/\/$/, "") + p, {
-            timeout: 10000,
-            headers: { "User-Agent": "Mozilla/5.0" }
-          });
-          return cheerio.load(res.data);
-        } catch {}
-      }
-      return null;
-    }
-
-    // ---------------- PHONES ----------------
-    let rawPhones = extractRawPhones($);
-    let phones = normalizePhones(rawPhones);
-
-    if (!email || phones.length === 0) {
-      const contact$ = await fetchContactPage(website);
-      if (contact$) {
-        if (!email) {
-          const t = contact$("body").text();
-          const em = t.match(
-            /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/
-          );
-          if (em) email = em[0];
-        }
-
-        rawPhones = [...rawPhones, ...extractRawPhones(contact$)];
-        phones = normalizePhones(rawPhones);
-      }
-    }
-
-    // ---------------- SOCIALS ----------------
     const socials = {};
     $("a[href]").each((_, el) => {
       const href = $(el).attr("href");
       if (!href) return;
-
       if (href.includes("instagram.com")) socials.instagram ??= href;
       if (href.includes("facebook.com")) socials.facebook ??= href;
       if (href.includes("linkedin.com")) socials.linkedin ??= href;
@@ -138,18 +114,37 @@ exports.scrapeCompany = async (req, res) => {
         socials.whatsapp ??= href;
     });
 
-    // ---------------- LOCATION ----------------
-    let location = null;
-    $("address").each((_, el) => {
-      const t = $(el).text().trim();
-      if (t.length > 20 && /\d/.test(t)) location = t;
-    });
+    /* -------- DEEP PAGES -------- */
 
-    // ---------------- SCRAPE STATUS (STEP 1) ----------------
+    const deepPages = await fetchDeepPages(website);
+
+    for (const page of deepPages) {
+      const $p = cheerio.load(page.html);
+      const text = $p("body").text();
+
+      about = safeMerge(about, $p("meta[name='description']").attr("content"));
+      email = safeMerge(email, extractEmail(text));
+
+      const newPhones = extractPhones(text);
+      if (phones.length === 0 && newPhones.length > 0) {
+        phones = newPhones;
+      }
+
+      if (!location) {
+        $p("address").each((_, el) => {
+          const t = $p(el).text().trim();
+          if (t.length > 20 && /\d/.test(t)) location = t;
+        });
+      }
+    }
+
+    /* -------- SCRAPE STATUS -------- */
+
     const scrapeStatus =
       name && about && about.length >= 50 ? "success" : "partial";
 
-    // ---------------- UPSERT ----------------
+    /* -------- UPSERT -------- */
+
     const company = await Company.findOneAndUpdate(
       { website },
       {
@@ -169,14 +164,13 @@ exports.scrapeCompany = async (req, res) => {
       { upsert: true, new: true }
     );
 
-    // ---------------- RESPONSE ----------------
     return res.status(200).json({
       success: true,
       status: scrapeStatus,
       data: company,
       error: null,
       meta: {
-        source: "axios",
+        source: "axios+deep-pages",
         durationMs: Date.now() - startTime
       }
     });
